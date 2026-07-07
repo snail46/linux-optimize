@@ -456,8 +456,9 @@ info "systemd-resolved: $HAS_RESOLVED"
 
 if [[ "$HAS_RESOLVED" == "active" ]]; then
     RESOLVED_CONF_CONTENT="[Resolve]
-DNS=223.5.5.5#dns.alidns.com 119.29.29.29#dot.pub
-FallbackDNS=1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google
+# 海外机房节点：优先使用境外DNS，避免境内DNS对Google/YouTube等域名的过滤污染
+DNS=1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google
+FallbackDNS=223.5.5.5#dns.alidns.com 119.29.29.29#dot.pub
 DNSOverTLS=opportunistic
 DNSSEC=allow-downgrade
 Cache=yes
@@ -479,9 +480,9 @@ LLMNR=no
         echo "$RESOLVED_CONF_CONTENT"
     fi
 else
-    RESOLV_CONTENT="nameserver 223.5.5.5
-nameserver 119.29.29.29
+    RESOLV_CONTENT="# 海外机房节点：仅使用境外DNS，避免境内DNS污染Google/YouTube等域名解析
 nameserver 1.1.1.1
+nameserver 8.8.8.8
 options ndots:2
 options timeout:2
 options attempts:2
