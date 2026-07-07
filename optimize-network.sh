@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Linux 节点网络一键优化脚本 v2.0
+#  Linux 节点网络一键优化脚本 v2.1（不含拥塞控制/BBR，由外部工具单独处理）
 #  适配范围：512MB 单核小鸡 ~ 32GB+ 多核大机
-#  功能：BBR自适应 / TCP调优 / DNS优化 / 按内存&CPU动态分级 / 安全边界保护
+#  功能：TCP调优 / DNS优化 / 按内存&CPU动态分级 / 安全边界保护
 #  用法：sudo bash optimize-network.sh [--dry-run] [--revert] [--yes]
 # =============================================================================
 
@@ -265,36 +265,8 @@ if ! $DRY_RUN; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 3: BBR / 拥塞控制自适应选择
-# ══════════════════════════════════════════════════════════════════════════════
-step "拥塞控制算法选择"
-
-BBR_CC="cubic"
-if [[ $KERNEL_MAJOR -gt 4 ]] || [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -ge 9 ]]; then
-    if modprobe tcp_bbr 2>/dev/null; then
-        BBR_CC="bbr"
-        if [[ $KERNEL_MAJOR -gt 5 ]] || [[ $KERNEL_MAJOR -eq 5 && $KERNEL_MINOR -ge 9 ]]; then
-            if modprobe tcp_bbr2 2>/dev/null; then
-                BBR_CC="bbr2"
-            fi
-        fi
-        log "拥塞控制: ${BBR_CC}（内核 $KERNEL 支持）"
-    else
-        warn "tcp_bbr 模块加载失败，回退到 cubic"
-    fi
-else
-    warn "内核版本 $KERNEL 过低（需要 ≥4.9），使用 cubic 拥塞控制"
-fi
-
-if (( CPU_CORES == 1 )) && [[ "$TIER" == "micro" ]]; then
-    info "检测到单核小内存机器，BBR 计算开销较低，仍建议使用（相比 cubic 更省重传）"
-fi
-
-QDISC="fq"
-[[ "$BBR_CC" == "cubic" ]] && QDISC="fq_codel"
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  Step 4: 写入 sysctl（按分级参数）
+#  说明: 拥塞控制(BBR等)由本脚本外的专用工具处理，此处不涉及
 # ══════════════════════════════════════════════════════════════════════════════
 step "写入内核网络参数 (sysctl) - 分级: ${TIER}"
 
@@ -303,10 +275,6 @@ SYSCTL_CONTENT="# ============================================================
 # 机器分级: ${TIER} | 内存: ${MEM_TOTAL_MB}MB | CPU: ${CPU_CORES}核
 # 生成时间: $(date)
 # ============================================================
-
-# ── 拥塞控制 ─────────────────────────────────────────────────
-net.core.default_qdisc = ${QDISC}
-net.ipv4.tcp_congestion_control = ${BBR_CC}
 
 # ── TCP/UDP 缓冲区（已按 20% 内存安全边界裁剪）───────────────
 net.core.rmem_max = ${RMEM_MAX}
@@ -380,7 +348,7 @@ fi
 
 info "参数预览 [${TIER}档]:"
 info "  buffer max: $(( RMEM_MAX/1024/1024 ))MB | somaxconn: ${SOMAXCONN} | conntrack: ${CONNTRACK_MAX}"
-info "  nofile: ${NOFILE} | swappiness: ${SWAPPINESS} | 拥塞控制: ${BBR_CC}+${QDISC}"
+info "  nofile: ${NOFILE} | swappiness: ${SWAPPINESS}"
 
 if ! $DRY_RUN; then
     mkdir -p "$(dirname "$SYSCTL_CONF")"
@@ -509,11 +477,6 @@ else
         warn "ethtool 未安装（apt/yum install ethtool 可获得更细致优化）"
     fi
 
-    if ! $DRY_RUN; then
-        tc qdisc replace dev "$PRIMARY_IF" root "$QDISC" 2>/dev/null && \
-            log "网卡发送队列调度已设为 ${QDISC}" || warn "tc qdisc 设置失败（容器环境常见，可忽略）"
-    fi
-
     if (( CPU_CORES >= 2 )) && ! $DRY_RUN; then
         for rxq in /sys/class/net/"$PRIMARY_IF"/queues/rx-*/rps_cpus; do
             [[ -f "$rxq" ]] || continue
@@ -592,8 +555,6 @@ if ! $DRY_RUN; then
             echo -e "  ${YELLOW}~${NC} $key = $actual (期望: $expected)"
         fi
     }
-    check_param "net.ipv4.tcp_congestion_control" "$BBR_CC"
-    check_param "net.core.default_qdisc" "$QDISC"
     check_param "net.ipv4.tcp_fastopen" "3"
     check_param "net.ipv4.tcp_tw_reuse" "1"
     check_param "net.core.rmem_max" ""
@@ -629,7 +590,6 @@ echo -e "${NC}"
 
 echo -e "${BOLD}机器分级：${TIER}${NC}（${MEM_TOTAL_MB}MB 内存 / ${CPU_CORES} 核）"
 echo -e "${BOLD}优化摘要：${NC}"
-echo -e "  ${GREEN}✓${NC} 拥塞控制: ${BBR_CC} + ${QDISC}"
 echo -e "  ${GREEN}✓${NC} TCP缓冲: 最大 $(( RMEM_MAX/1024/1024 ))MB（已做20%内存安全边界裁剪）"
 echo -e "  ${GREEN}✓${NC} conntrack表: ${CONNTRACK_MAX} 条（按内存自动计算，防OOM）"
 echo -e "  ${GREEN}✓${NC} 文件描述符: ${NOFILE}"
