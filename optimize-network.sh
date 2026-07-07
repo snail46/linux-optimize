@@ -222,28 +222,76 @@ info "conntrack 表大小: ${CONNTRACK_MAX}（按内存自动计算，约占用 
 # ══════════════════════════════════════════════════════════════════════════════
 step "Swap 检测"
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Step 1: 低内存机器 Swap 检测与建议（含磁盘空间安全检测）
+# ══════════════════════════════════════════════════════════════════════════════
+step "Swap 检测"
+
 if (( MEM_TOTAL_MB < 1536 )) && (( SWAP_TOTAL_KB == 0 )); then
     warn "检测到低内存机器（${MEM_TOTAL_MB}MB）且无 Swap，代理服务在流量高峰易 OOM"
 
-    NEED_SWAP=false
-    if $AUTO_YES; then
-        NEED_SWAP=true
-    elif ! $DRY_RUN; then
-        read -rp "是否自动创建 1GB Swap 文件以提升稳定性？[Y/n]: " ans
-        [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && NEED_SWAP=true
+    # ── 磁盘空间检测：swap 文件计划创建的分区（跟 /swapfile 保持一致，即根分区）─
+    SWAP_TARGET_PATH="/"
+    DISK_AVAIL_KB=$(df -Pk "$SWAP_TARGET_PATH" | awk 'NR==2{print $4}')
+    DISK_AVAIL_MB=$(( DISK_AVAIL_KB / 1024 ))
+    info "根分区可用磁盘空间: ${DISK_AVAIL_MB}MB"
+
+    # 期望的 swap 大小（内存越小期望值越大，但最终会被磁盘空间进一步裁剪）
+    DESIRED_SWAP_MB=1024
+    (( MEM_TOTAL_MB < 512 )) && DESIRED_SWAP_MB=2048
+
+    # 安全边界：
+    #   1) 创建 swap 后，磁盘至少保留 DISK_RESERVE_MB 剩余空间（给日志/系统/面板留余量）
+    #   2) swap 最多只占用"当前可用空间"的 40%，避免一次性吃满小盘 NAT 机器
+    DISK_RESERVE_MB=512
+    MIN_USEFUL_SWAP_MB=256   # 低于这个大小意义不大，直接跳过
+
+    if (( DISK_AVAIL_MB <= DISK_RESERVE_MB )); then
+        SAFE_SWAP_MB=0
+    else
+        SAFE_SWAP_MB=$(( (DISK_AVAIL_MB - DISK_RESERVE_MB) * 40 / 100 ))
+    fi
+
+    # 最终大小取"期望值"和"磁盘安全上限"中较小者
+    if (( SAFE_SWAP_MB < DESIRED_SWAP_MB )); then
+        SWAP_SIZE_MB=$SAFE_SWAP_MB
+    else
+        SWAP_SIZE_MB=$DESIRED_SWAP_MB
+    fi
+
+    if (( SWAP_SIZE_MB < MIN_USEFUL_SWAP_MB )); then
+        warn "可用磁盘空间过低（${DISK_AVAIL_MB}MB，预留${DISK_RESERVE_MB}MB后可安全用于swap的空间不足${MIN_USEFUL_SWAP_MB}MB），跳过创建 Swap"
+        warn "该机器磁盘容量较小（常见于 NAT 小鸡），建议直接清理磁盘空间或升级套餐，而非依赖 Swap"
+        NEED_SWAP=false
+    else
+        (( SWAP_SIZE_MB < DESIRED_SWAP_MB )) && \
+            info "按磁盘空间自动将 Swap 从期望的 ${DESIRED_SWAP_MB}MB 裁剪至 ${SWAP_SIZE_MB}MB（磁盘剩余 ${DISK_AVAIL_MB}MB）"
+
+        NEED_SWAP=false
+        if $AUTO_YES; then
+            NEED_SWAP=true
+        elif ! $DRY_RUN; then
+            read -rp "是否自动创建 ${SWAP_SIZE_MB}MB Swap 文件以提升稳定性？[Y/n]: " ans
+            [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]] && NEED_SWAP=true
+        fi
     fi
 
     if $NEED_SWAP && ! $DRY_RUN; then
         if [[ ! -f /swapfile ]]; then
-            SWAP_SIZE_MB=1024
-            (( MEM_TOTAL_MB < 512 )) && SWAP_SIZE_MB=2048
-            fallocate -l ${SWAP_SIZE_MB}M /swapfile 2>/dev/null || \
-                dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE_MB >> "$LOG_FILE" 2>&1
-            chmod 600 /swapfile
-            mkswap /swapfile >> "$LOG_FILE" 2>&1
-            swapon /swapfile >> "$LOG_FILE" 2>&1
-            grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-            log "已创建 ${SWAP_SIZE_MB}MB Swap 并持久化到 /etc/fstab"
+            # 创建前再次确认磁盘空间没有在期间被其他进程吃掉
+            CURRENT_AVAIL_KB=$(df -Pk "$SWAP_TARGET_PATH" | awk 'NR==2{print $4}')
+            CURRENT_AVAIL_MB=$(( CURRENT_AVAIL_KB / 1024 ))
+            if (( CURRENT_AVAIL_MB < SWAP_SIZE_MB + DISK_RESERVE_MB )); then
+                warn "创建前复检发现磁盘空间已不足（当前可用 ${CURRENT_AVAIL_MB}MB），取消创建 Swap 以避免打满磁盘"
+            else
+                fallocate -l ${SWAP_SIZE_MB}M /swapfile 2>/dev/null || \
+                    dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE_MB >> "$LOG_FILE" 2>&1
+                chmod 600 /swapfile
+                mkswap /swapfile >> "$LOG_FILE" 2>&1
+                swapon /swapfile >> "$LOG_FILE" 2>&1
+                grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+                log "已创建 ${SWAP_SIZE_MB}MB Swap 并持久化到 /etc/fstab（创建后磁盘预计剩余 $((CURRENT_AVAIL_MB - SWAP_SIZE_MB))MB）"
+            fi
         else
             info "/swapfile 已存在，跳过创建"
         fi
@@ -251,6 +299,7 @@ if (( MEM_TOTAL_MB < 1536 )) && (( SWAP_TOTAL_KB == 0 )); then
 else
     info "Swap 状态正常，跳过"
 fi
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Step 2: 备份现有配置
