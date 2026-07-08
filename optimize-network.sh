@@ -218,11 +218,6 @@ CONNTRACK_MAX=$(( MEM_TOTAL_KB * 1024 / 16384 ))
 info "conntrack 表大小: ${CONNTRACK_MAX}（按内存自动计算，约占用 $(( CONNTRACK_MAX * 350 / 1024 / 1024 ))MB）"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 1: 低内存机器 Swap 检测与建议
-# ══════════════════════════════════════════════════════════════════════════════
-step "Swap 检测"
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  Step 1: 低内存机器 Swap 检测与建议（含磁盘空间安全检测）
 # ══════════════════════════════════════════════════════════════════════════════
 step "Swap 检测"
@@ -613,13 +608,42 @@ if ! $DRY_RUN; then
 
     echo ""
     echo -e "${BOLD}── DNS 解析测试 ─────────────────────────────────────${NC}"
-    for domain in google.com youtube.com; do
-        if result=$(dig +short +time=3 "$domain" A 2>/dev/null | head -1) && [[ -n "$result" ]]; then
-            echo -e "  ${GREEN}✓${NC} $domain → $result"
-        else
-            echo -e "  ${RED}✗${NC} $domain 解析失败（检查防火墙/DNS配置）"
+
+    resolve_test() {
+        local domain=$1 ip=""
+        # 优先用 getent：glibc 自带，几乎所有发行版都有，且直接走系统NSS解析路径
+        # （最接近真实应用程序的解析行为），不需要额外安装任何包
+        if command -v getent &>/dev/null; then
+            ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')
         fi
+        if [[ -z "$ip" ]] && command -v dig &>/dev/null; then
+            ip=$(dig +short +time=3 "$domain" A 2>/dev/null | grep -Eo '^[0-9.]+' | head -1)
+        fi
+        if [[ -z "$ip" ]] && command -v nslookup &>/dev/null; then
+            ip=$(nslookup -timeout=3 "$domain" 2>/dev/null | awk '/^Address: /{print $2; exit}')
+        fi
+        if [[ -z "$ip" ]] && command -v host &>/dev/null; then
+            ip=$(host "$domain" 2>/dev/null | awk '/has address/{print $NF; exit}')
+        fi
+        echo "$ip"
+    }
+
+    HAS_ANY_DNS_TOOL=false
+    for tool in getent dig nslookup host; do
+        command -v "$tool" &>/dev/null && HAS_ANY_DNS_TOOL=true && break
     done
+    if ! $HAS_ANY_DNS_TOOL; then
+        warn "未找到 getent/dig/nslookup/host 任一工具，跳过 DNS 验证测试（不代表DNS配置有问题）"
+    else
+        for domain in google.com youtube.com; do
+            result=$(resolve_test "$domain")
+            if [[ -n "$result" ]]; then
+                echo -e "  ${GREEN}✓${NC} $domain → $result"
+            else
+                echo -e "  ${RED}✗${NC} $domain 解析失败（检查防火墙/DNS配置）"
+            fi
+        done
+    fi
 
     echo ""
     echo -e "${BOLD}── 内存使用状况 ─────────────────────────────────────${NC}"
